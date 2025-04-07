@@ -50,8 +50,8 @@ if __name__ == "__main__":
 
     print(combined_data.iloc[0])
 
-    plots.set_dir(args.output)
-    plots.plot(combined_data)
+    # plots.set_dir(args.output)
+    # plots.plot(combined_data)
 
     
 
