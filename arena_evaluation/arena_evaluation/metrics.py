@@ -350,17 +350,11 @@ class Metrics:
         collisions = []
         collisions_marker = []
 
-        eps = 0.015 # empirical, scan never actually gets to robot radius
-
         for i, scan in enumerate(laser_scans):
 
             # print(scan)
 
-            if len(scan) == 0:
-                print("Scan length is zero!")
-                continue
-
-            is_collision = len(scan[scan <= (lower_bound + eps)]) > 0
+            is_collision = len(scan[scan <= lower_bound]) > 0
 
             collisions_marker.append(is_collision)
             
@@ -413,14 +407,8 @@ class PedsimMetrics(Metrics):
         super_analysis = super()._analyze_episode(episode, index)
 
         robot_position = np.array([odom["position"][:2] for odom in episode["odom"]])
+        peds_position = np.array([[ped.position for ped in peds] for peds in episode["peds"]])
 
-
-        if (len(episode["peds"] == 0)  or len(episode["peds"][0]) == 0):
-            # print("NO PEDESTRIANS!")
-            peds_position = np.array([ [0, 0] for peds in episode["peds"] ])
-        else:
-            peds_position = np.array([[ped.position for ped in peds] for peds in episode["peds"]])
-        
         # list of (timestamp, ped) indices, duplicate timestamps allowed
         personal_space_frames = np.linalg.norm(peds_position - robot_position[:,None], axis=-1) <= Config.PERSONAL_SPACE_RADIUS
         # list of timestamp indices, no duplicates
@@ -439,12 +427,7 @@ class PedsimMetrics(Metrics):
 
         # gazes
         robot_direction = np.array([odom["position"][2] for odom in episode["odom"]])
-
-        if (len(episode["peds"] == 0)  or len(episode["peds"][0]) == 0):
-            # print("NO PEDESTRIANS!")
-            peds_direction = np.array([ 0.0 for peds in episode["peds"] ])
-        else:
-            peds_direction = np.array([[ped.theta for ped in peds] for peds in episode["peds"]])
+        peds_direction = np.array([[ped.theta for ped in peds] for peds in episode["peds"]])
         angle_robot_peds = np.squeeze(np.angle(np.array(peds_position - robot_position[:,np.newaxis]).view(np.complex128)))
 
         # time looking at pedestrians
