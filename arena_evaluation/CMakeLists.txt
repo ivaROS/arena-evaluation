@@ -20,6 +20,7 @@ catkin_install_python(PROGRAMS
   scripts/get_metrics
   scripts/create_plots
   scripts/process_data
+  scripts/process_data_static
 
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
