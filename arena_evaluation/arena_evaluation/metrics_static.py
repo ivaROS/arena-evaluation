@@ -350,11 +350,16 @@ class Metrics:
         collisions = []
         collisions_marker = []
 
-        eps = 0.015 # empirical, scan never actually gets to robot radius
+        eps = 0.0075 # empirical, scan never actually gets to robot radius
+
+        print("Lower bound: ", lower_bound)
+        print("Lower bound + eps: ", lower_bound + eps)
 
         for i, scan in enumerate(laser_scans):
 
             # print(scan)
+
+            print("Min scan: ", min(scan))
 
             if len(scan) == 0:
                 print("Scan length is zero!")
