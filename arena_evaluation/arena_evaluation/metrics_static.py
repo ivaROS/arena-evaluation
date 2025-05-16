@@ -350,7 +350,7 @@ class Metrics:
         collisions = []
         collisions_marker = []
 
-        eps = 0.0075 # empirical, scan never actually gets to robot radius
+        eps = 0.01 # 0.0075 # empirical, scan never actually gets to robot radius
 
         print("Lower bound: ", lower_bound)
         print("Lower bound + eps: ", lower_bound + eps)
