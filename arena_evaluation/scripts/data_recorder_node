@@ -7,10 +7,9 @@ import numpy as np
 import csv
 import os
 import math
-import re
+import threading
 from rosgraph_msgs.msg import Clock
 from rospy.core import traceback
-import rostopic
 import rospkg
 from datetime import datetime
 import yaml
@@ -27,6 +26,9 @@ from arena_evaluation.utils import Pedestrian
 
 # for transformations
 from tf.transformations import euler_from_quaternion
+
+# m/s; below this a pedestrian's heading is taken from its force
+PEDESTRIAN_MIN_SPEED = 0.01
 
 
 class DataCollector:
@@ -45,7 +47,12 @@ class DataCollector:
             return
 
         self.full_topic_name = topic[1]
-        self.data = None
+        # held message and its receive time in ns, replaced together so a
+        # row never pairs new data with an old receive time
+        self.sample = (None, None)
+        # smallest scan range since the last row, see take_scan_min()
+        self._scan_min_lock = threading.Lock()
+        self._scan_min = None
 
         print(topic[0])
 
@@ -56,14 +63,35 @@ class DataCollector:
         
         self.data = msg_scenario_reset.data
 
+    def hold(self, data):
+        stamp = rospy.get_rostime()
+        self.sample = (data, stamp.secs * 10**9 + stamp.nsecs)
+
     def laserscan_callback(self, msg_laserscan: LaserScan):
-        self.data = [msg_laserscan.range_max if math.isnan(val) else round(val, 3) for val in msg_laserscan.ranges]
+        ranges = [msg_laserscan.range_max if math.isnan(val) else round(val, 3) for val in msg_laserscan.ranges]
+
+        # before hold(): a scan written to a row is always in that row's scan_min
+        if ranges:
+            with self._scan_min_lock:
+                scan_min = min(ranges)
+                if self._scan_min is None or scan_min < self._scan_min:
+                    self._scan_min = scan_min
+
+        self.hold(ranges)
+
+    def take_scan_min(self):
+        # smallest range of every scan received since the last call, so a
+        # contact between two rows is not missed; None if no scan arrived
+        with self._scan_min_lock:
+            scan_min, self._scan_min = self._scan_min, None
+
+        return scan_min
 
     def odometry_callback(self, msg_odometry: Odometry):
         pose3d = msg_odometry.pose.pose
         twist = msg_odometry.twist.twist
 
-        self.data = {
+        self.hold({
             "position": [
                 round(val, 3) for val in [
                     pose3d.position.x,
@@ -85,69 +113,75 @@ class DataCollector:
                     twist.angular.z
                 ]
             ]
-        }
+        })
 
     def action_callback(self, msg_action: Twist): # variables will be written to csv whenever an action is published
-        self.data = [
+        self.hold([
             round(val, 3) for val in [
                 msg_action.linear.x,
                 msg_action.linear.y,
                 msg_action.angular.z
             ]
-        ]
+        ])
+
+    @staticmethod
+    def pedestrian_heading(agent):
+        # heading of the walk; the force direction only when standing still
+        if math.hypot(agent.twist.linear.x, agent.twist.linear.y) > PEDESTRIAN_MIN_SPEED:
+            return np.arctan2(agent.twist.linear.y, agent.twist.linear.x)
+
+        return np.arctan2(agent.forces.force.y, agent.forces.force.x)
 
     def pedsim_callback(self, msg_pedsim: pedsim_msgs.PedsimAgentsDataframe):
-        self.data = [
+        self.hold([
             Pedestrian(
                 id = agent.id,
                 type = agent.type,
                 social_state = agent.social_state,
                 position = [agent.pose.position.x, agent.pose.position.y],
-                theta = np.arctan2(agent.forces.force.y, agent.forces.force.x),
-                destination = [agent.destination.x, agent.destination.y]
+                theta = self.pedestrian_heading(agent),
+                destination = [agent.destination.x, agent.destination.y],
+                velocity = [agent.twist.linear.x, agent.twist.linear.y]
             )._asdict()
             for agent
             in msg_pedsim.agent_states
-        ]
+        ])
 
     def get_data(self):
+        data, msg_time = self.sample
+
         return (
             self.full_topic_name,
-            self.data 
+            data,
+            msg_time
         )
+
+    def shutdown(self):
+        subscriber = getattr(self, "subscriber", None)
+        if subscriber is not None:
+            subscriber.unregister()
+            self.subscriber = None
 
 
 class Recorder:
     def __init__(self, result_dir):
         self.model = rospy.get_param(os.path.join(rospy.get_namespace(), "model"), "")
 
+        # guards against callbacks that are still running while shutdown() is called
+        self._lock = threading.Lock()
+        self._active = True
+
         self.base_dir = rospkg.RosPack().get_path("arena_evaluation")
         self.result_dir = os.path.join(self.base_dir, "data", result_dir)
 
         os.makedirs(self.result_dir, exist_ok=True)
-        
+
+        self.config = self.read_config()
+
         self.write_params()
 
-        topics_to_monitor = self.get_topics_to_monitor()
-
-        topics = rostopic.get_topic_list()
-        published_topics = topics[0]
-
-        topic_matcher = re.compile(f"({'|'.join([t[0] for t in topics_to_monitor])})$")
-
-        topics_to_sub = []
-
-        for t in published_topics:
-            topic_name = t[0]
-
-            match = re.search(topic_matcher, topic_name)
-
-            if not match: 
-                continue
-
-            topics_to_sub.append([topic_name, *self.get_class_for_topic_name(topic_name)])
-
-            # topics_to_sub.append([topic_name, *[t for t in topics_to_monitor if t[0] == match.group()][0]])
+        # subscribe by name, whether or not the topic is published yet
+        topics_to_sub = self.get_topics_to_monitor()
 
         self.data_collectors = []
 
@@ -155,17 +189,18 @@ class Recorder:
             self.data_collectors.append(DataCollector(topic))
             self.write_data(
                 topic[1], [
-                    "time", "data"
+                    "time", "data", "msg_time"
                 ],
                 mode="w"
             )
 
         self.write_data("episode", ["time", "episode"], mode="w")
         self.write_data("start_goal", ["episode", "start", "goal"], mode="w")
+        self.write_data("scan_min", ["time", "data"], mode="w")
 
         self.current_episode = 0
-
-        self.config = self.read_config()
+        # one start_goal row per episode, see write_start_goal()
+        self.start_goal_written = False
 
         self.current_time = None
         self.clock_sub = rospy.Subscriber("/clock", Clock, self.clock_callback)
@@ -174,13 +209,41 @@ class Recorder:
 
         # print(rosparam.print_params("", "/"))
 
+    def shutdown(self):
+        # stop all subscribers and wait for a running write to finish, so this
+        # recorder never writes into its folder again
+        with self._lock:
+            self._active = False
+
+            for sub in [self.clock_sub, self.scenario_reset_sub]:
+                sub.unregister()
+
+            for collector in self.data_collectors:
+                collector.shutdown()
+
     def scenario_reset_callback(self, data: Int16):
-        self.current_episode = data.data
+        with self._lock:
+            if not self._active:
+                return
+
+            self.current_episode = data.data
+            # the task generator sets the start and goal params before it
+            # publishes scenario_reset, so they belong to this episode
+            self.write_start_goal()
 
     def clock_callback(self, clock: Clock):
-        current_simulation_action_time = clock.clock.secs * 10e9 + clock.clock.nsecs
+        with self._lock:
+            if not self._active:
+                return
 
-        if not self.current_time:
+            self._record(clock)
+
+    def _record(self, clock: Clock):
+        # true ros time in ns (integer), see time_unit in params.yaml
+        current_simulation_action_time = clock.clock.secs * 10**9 + clock.clock.nsecs
+
+        # a sim time of 0 is a valid time
+        if self.current_time is None:
             self.current_time = current_simulation_action_time
 
         time_diff = (current_simulation_action_time - self.current_time) / 1e6 ## in ms
@@ -191,38 +254,40 @@ class Recorder:
         self.current_time = current_simulation_action_time
 
         for collector in self.data_collectors:
-            topic_name, data = collector.get_data()
+            topic_name, data, msg_time = collector.get_data()
             
-            self.write_data(topic_name, [self.current_time, data])
+            self.write_data(topic_name, [self.current_time, data, msg_time])
+
+            if topic_name == "scan":
+                scan_min = collector.take_scan_min()
+                self.write_data("scan_min", [self.current_time, "" if scan_min is None else scan_min])
         
         self.write_data("episode", [self.current_time, self.current_episode])
+
+        # first episode when no scenario_reset arrived yet; a later
+        # scenario_reset for the same episode writes a newer row
+        if not self.start_goal_written:
+            self.write_start_goal()
+
+    def write_start_goal(self):
         self.write_data("start_goal", [
             self.current_episode, 
             rospy.get_param(rospy.get_namespace() + "start", [0, 0, 0]), 
             rospy.get_param(rospy.get_namespace() + "goal", [0, 0, 0])
         ])
+        self.start_goal_written = True
 
     def read_config(self):
         with open(self.base_dir + "/data_recorder_config.yaml") as file:
             return yaml.safe_load(file)
 
-    def get_class_for_topic_name(self, topic_name):
-        if "/scan" in topic_name:
-            return ["scan", LaserScan]
-        if "/odom" in topic_name:
-            return ["odom", Odometry]
-        if "/cmd_vel" in topic_name:
-            return ["cmd_vel", Twist]
-        if "/pedsim_agents_data" in topic_name:
-            return ["pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe]
-
     def get_topics_to_monitor(self):
+        # [topic name, csv file name, message class]
         return [
-            (os.path.join(rospy.get_namespace(), "scan"), LaserScan),
-            (os.path.join(rospy.get_namespace(), "scenario_reset"), Int16),
-            (os.path.join(rospy.get_namespace(), "odom"), Odometry),
-            (os.path.join(rospy.get_namespace(), "cmd_vel"), Twist),
-            ("/pedsim_simulator/pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe)
+            [os.path.join(rospy.get_namespace(), "scan"), "scan", LaserScan],
+            [os.path.join(rospy.get_namespace(), "odom"), "odom", Odometry],
+            [os.path.join(rospy.get_namespace(), "cmd_vel"), "cmd_vel", Twist],
+            ["/pedsim_simulator/pedsim_agents_data", "pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe]
         ]
 
     def write_data(self, file_name, data, mode="a"):
@@ -240,8 +305,25 @@ class Recorder:
                 "inter_planner": rospy.get_param(rospy.get_namespace() + "inter_planner", ""),
                 "local_planner": rospy.get_param(rospy.get_namespace() + "local_planner", ""),
                 "agent_name": rospy.get_param(rospy.get_namespace() + "agent_name", ""),
-                "namespace": rospy.get_namespace().replace("/", "")
+                "namespace": rospy.get_namespace().replace("/", ""),
+                "time_unit": "ns",
+                # run settings needed to interpret the data later
+                "man_gap": rospy.get_param("/man_gap", None),
+                "use_sim_time": rospy.get_param("/use_sim_time", None),
+                "record_frequency": self.config["record_frequency"],
+                "task_timeout": rospy.get_param("/task_generator_server/timeout", None),
+                "goal_radius": rospy.get_param("/task_generator_server/goal_radius", None),
+                "goal_tolerance_angle": rospy.get_param("/task_generator_server/goal_tolerance_angle", None)
             }, file)
+
+
+def replace_recorder(recorder: Recorder, result_dir: str) -> Recorder:
+    # the old recorder must stop once the new one exists, otherwise it keeps
+    # writing every later episode into its old folder. If the new one cannot
+    # be created, the old one keeps recording.
+    new_recorder = Recorder(result_dir)
+    recorder.shutdown()
+    return new_recorder
 
 
 if __name__=="__main__":
@@ -271,11 +353,17 @@ if __name__=="__main__":
         return directory
 
     recorder = Recorder(get_directory(arguments.dir))
+    reconfigure_lock = threading.Lock()
 
     def reconfigure(directory:str):
         global recorder
-        del recorder
-        recorder = Recorder(get_directory(directory))
+        with reconfigure_lock:
+            try:
+                recorder = replace_recorder(recorder, get_directory(directory))
+            except Exception:
+                rospy.logerr("data_recorder: could not record into {}, still recording into {}\n{}".format(
+                    directory, recorder.result_dir, traceback.format_exc()))
+                return False
         return True
 
     #time.sleep(5)   
